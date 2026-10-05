@@ -9,6 +9,20 @@ class AuditTrail:
     def __init__(self, repository):
         self.repository = repository
 
+    def record_conn(self, connection, entity_id, actor, action, from_status, to_status, detail=None):
+        """Write an audit row inside an already-open transaction so the
+        state change and its trail commit atomically."""
+        self.repository.append_audit_conn(
+            connection,
+            entity_id=entity_id,
+            actor_id=actor.user_id,
+            actor_role=actor.role,
+            action=action,
+            from_status=from_status,
+            to_status=to_status,
+            detail=detail or {},
+        )
+
     def record(self, entity_id, actor, action, from_status, to_status, detail=None):
         self.repository.append_audit(
             entity_id=entity_id,
