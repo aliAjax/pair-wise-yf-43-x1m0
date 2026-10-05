@@ -26,6 +26,19 @@ python3 app.py --db ./data.db --port 8309
 
 - `instrument`：仪器状态；`calibration`：校准记录；`method`：方法版本；`result`：检测结果。
 
+## 依赖重算
+
+结果与仪器、校准、方法之间按版本登记依赖，上游失效会立即重算下游结果：
+
+- **放行登记**：结果放行（`release`）时在同一事务内登记当前有效的仪器、校准记录和方法版本快照（`data.releases`，含 `instrument_version`、`calibration_id/version/due_at`、`method_version`、放行人和时间），并校验仪器 `active`、校准在有效期内、方法 `validated` 且覆盖该仪器。原始测量值 `measurement` 始终保留。
+- **上游失效立即重算**：校准撤销（`revoke`）、方法吊销（`revoke_method`）、仪器隔离（`quarantine`）在同一事务内把依赖它的已放行结果置为 `review`（待复核），并写入 `invalidate` 审计，原因可查。
+- **重新放行**：待复核结果再次 `release` 时按当前有效校准和方法重新校验，通过后追加一条放行记录（历次放行记录留存可查），不通过则保持待复核。
+- **到期扫描**：`POST /api/results/recalculate` 扫描已放行结果，校准到期或依赖失效的转入待复核。
+- **回填**：`POST /api/results/backfill` 对没有依赖登记的历史已放行结果，按仪器当前状态回填依赖快照；依赖已失效的转入待复核。回填幂等（已登记的跳过）、按小批量短事务提交，不打扰新结果放行。
+- **先到的生效**：所有状态变更在 `BEGIN IMMEDIATE` 事务内完成，放行在事务内重校依赖状态，消除「先查后写」的竞态；放行数据可带 `expected_versions`（`{"instrument": n, "calibration": n, "method": n}`）做依赖乐观锁，依赖已被先到的操作改动时返回 `409 ConflictError`。
+
+结果状态机：`pending` → `released` → `review`（待复核）→ 重新 `release`；`pending` → `blocked` → `pending`。
+
 ## 主要接口
 
 - `GET /health`：健康检查。
@@ -33,6 +46,8 @@ python3 app.py --db ./data.db --port 8309
 - `POST /api/<kind>`：创建对象；请求体为JSON。
 - `GET /api/entities/<id>`：读取对象当前版本。
 - `POST /api/entities/<id>/actions`：提交`{"action":"动作名","data":{...},"expected_version":数字}`。
+- `POST /api/results/backfill`：回填历史结果依赖快照（仅管理员）。
+- `POST /api/results/recalculate`：扫描并失效到期/失效依赖的已放行结果（仅管理员）。
 - `GET /api/audit`：读取审计记录。
 
 请求身份通过`X-User-Id`和`X-Role`请求头传入。创建和动作的可执行角色由规则引擎控制。

@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timezone
 
 from .domain import (
     ConflictError,
@@ -6,6 +6,10 @@ from .domain import (
     PermissionDenied,
     ValidationError,
 )
+
+
+def _today():
+    return datetime.now(timezone.utc).date().isoformat()
 
 
 def _validate_calibration(actor, data, lookup):
@@ -25,18 +29,85 @@ def calibration_current(due_at, as_of):
     return str(due_at) >= str(as_of)
 
 
+def _current_calibration(lookup, instrument_id, as_of):
+    calibrations = lookup("calibration", "instrument_id", instrument_id) or []
+    current = [
+        cal
+        for cal in calibrations
+        if cal["status"] == "approved"
+        and calibration_current(cal["data"].get("due_at", ""), as_of)
+    ]
+    return current[-1] if current else None
+
+
+def instrument_calibration_current(lookup, instrument, as_of):
+    calibrations = lookup("calibration", "instrument_id", instrument["id"]) or []
+    current = [
+        cal
+        for cal in calibrations
+        if cal["status"] == "approved"
+        and calibration_current(cal["data"].get("due_at", ""), as_of)
+    ]
+    if calibrations:
+        return bool(current), (current[-1] if current else None)
+    return calibration_current(instrument["data"].get("due_at", ""), as_of), None
+
+
 def _validate_result_release(actor, entity, data, lookup):
     instrument = _find_one(lookup, "instrument", "id", data.get("instrument_id"))
-    method = _find_one(lookup, "method", "id", data.get("method_id"))
-    if not instrument or instrument["status"] != "active":
+    if not instrument:
+        raise ValidationError("instrument does not exist")
+    if instrument["status"] != "active":
         raise ValidationError("result requires an active instrument")
-    if not calibration_current(instrument["data"].get("due_at", ""), "2026-09-24"):
+    as_of = _today()
+    cal_current, calibration = instrument_calibration_current(lookup, instrument, as_of)
+    if not cal_current:
         raise ValidationError("instrument calibration is not current")
+    method = _find_one(lookup, "method", "id", data.get("method_id"))
     if not method or method["status"] != "validated":
         raise ValidationError("result requires a validated method")
-    if data.get("instrument_id") not in method["data"].get("instrument_ids", []):
+    if instrument["id"] not in method["data"].get("instrument_ids", []):
         raise ValidationError("method is not validated for this instrument")
-    return {"released_by": actor.user_id}
+    expected = data.get("expected_versions") or {}
+    for key, dependency in (
+        ("instrument", instrument),
+        ("calibration", calibration),
+        ("method", method),
+    ):
+        expected_version = expected.get(key)
+        if expected_version is not None and int(expected_version) != int(dependency["version"]):
+            raise ConflictError(
+                "dependency %s version conflict: expected %s, found %s"
+                % (key, expected_version, dependency["version"])
+            )
+    record = {
+        "released_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "released_by": actor.user_id,
+        "instrument_id": instrument["id"],
+        "instrument_version": instrument["version"],
+        "instrument_status": instrument["status"],
+        "calibration_id": calibration["id"] if calibration else None,
+        "calibration_version": calibration["version"] if calibration else None,
+        "calibration_due_at": (
+            calibration["data"].get("due_at")
+            if calibration
+            else instrument["data"].get("due_at", "")
+        ),
+        "method_id": method["id"],
+        "method_version": method["version"],
+        "value": data.get("value"),
+        "unit": data.get("unit"),
+    }
+    releases = list(entity["data"].get("releases", []))
+    releases.append(record)
+    return {
+        "instrument_id": instrument["id"],
+        "calibration_id": record["calibration_id"],
+        "method_id": method["id"],
+        "value": data.get("value"),
+        "unit": data.get("unit"),
+        "releases": releases,
+    }
 
 
 CUSTOM_CREATE = {'calibration': _validate_calibration}
@@ -46,11 +117,11 @@ CUSTOM_TRANSITIONS = {('calibration', 'perform'): _validate_perform, ('result', 
 class RuleEngine:
     ALIASES = {'instruments': 'instrument', 'calibrations': 'calibration', 'methods': 'method', 'results': 'result'}
     INITIAL_STATUS = {'instrument': 'active', 'calibration': 'requested', 'method': 'draft', 'result': 'pending'}
-    TRANSITIONS = {'instrument': {'send_calibration': (('active',), 'calibrating'), 'calibrate': (('calibrating',), 'active'), 'quarantine': (('active',), 'quarantined'), 'restore': (('quarantined',), 'active')}, 'calibration': {'perform': (('requested', 'failed'), 'passed'), 'approve': (('passed',), 'approved'), 'reject': (('failed',), 'rejected')}, 'method': {'validate_method': (('draft',), 'validated'), 'revoke_method': (('validated',), 'revoked')}, 'result': {'release': (('pending',), 'released'), 'block': (('pending',), 'blocked'), 'reanalyze': (('blocked',), 'pending')}}
+    TRANSITIONS = {'instrument': {'send_calibration': (('active',), 'calibrating'), 'calibrate': (('calibrating',), 'active'), 'quarantine': (('active',), 'quarantined'), 'restore': (('quarantined',), 'active')}, 'calibration': {'perform': (('requested', 'failed'), 'passed'), 'approve': (('passed',), 'approved'), 'reject': (('failed',), 'rejected'), 'revoke': (('approved',), 'revoked')}, 'method': {'validate_method': (('draft',), 'validated'), 'revoke_method': (('validated',), 'revoked')}, 'result': {'release': (('pending', 'review'), 'released'), 'block': (('pending',), 'blocked'), 'reanalyze': (('blocked',), 'pending')}}
     CREATE_REQUIRED = {'instrument': ('name', 'serial'), 'calibration': ('instrument_id', 'requested_at'), 'method': ('name', 'version'), 'result': ('sample_id', 'measurement')}
-    ACTION_REQUIRED = {('instrument', 'calibrate'): ('due_at', 'passed'), ('instrument', 'quarantine'): ('reason',), ('calibration', 'perform'): ('result', 'performed_at', 'uncertainty'), ('calibration', 'approve'): ('authorized_by',), ('calibration', 'reject'): ('reason',), ('method', 'validate_method'): ('parameters', 'instrument_ids'), ('method', 'revoke_method'): ('reason',), ('result', 'release'): ('instrument_id', 'method_id', 'value', 'unit'), ('result', 'block'): ('reason',), ('result', 'reanalyze'): ('reason',)}
+    ACTION_REQUIRED = {('instrument', 'calibrate'): ('due_at', 'passed'), ('instrument', 'quarantine'): ('reason',), ('calibration', 'perform'): ('result', 'performed_at', 'uncertainty'), ('calibration', 'approve'): ('authorized_by',), ('calibration', 'reject'): ('reason',), ('calibration', 'revoke'): ('reason',), ('method', 'validate_method'): ('parameters', 'instrument_ids'), ('method', 'revoke_method'): ('reason',), ('result', 'release'): ('instrument_id', 'method_id', 'value', 'unit'), ('result', 'block'): ('reason',), ('result', 'reanalyze'): ('reason',)}
     CREATE_ROLES = {'instrument': ('admin', 'technician'), 'calibration': ('admin', 'metrology'), 'method': ('admin', 'authorizer'), 'result': ('admin', 'analyst')}
-    ROLE_ACTIONS = {'send_calibration': ('admin', 'technician'), 'calibrate': ('admin', 'metrology'), 'quarantine': ('admin', 'metrology'), 'restore': ('admin', 'metrology'), 'perform': ('admin', 'metrology'), 'approve': ('admin', 'authorizer'), 'reject': ('admin', 'authorizer'), 'validate_method': ('admin', 'authorizer'), 'revoke_method': ('admin', 'authorizer'), 'release': ('admin', 'analyst'), 'block': ('admin', 'analyst'), 'reanalyze': ('admin', 'analyst')}
+    ROLE_ACTIONS = {'send_calibration': ('admin', 'technician'), 'calibrate': ('admin', 'metrology'), 'quarantine': ('admin', 'metrology'), 'restore': ('admin', 'metrology'), 'perform': ('admin', 'metrology'), 'approve': ('admin', 'authorizer'), 'reject': ('admin', 'authorizer'), 'revoke': ('admin', 'metrology'), 'validate_method': ('admin', 'authorizer'), 'revoke_method': ('admin', 'authorizer'), 'release': ('admin', 'analyst'), 'block': ('admin', 'analyst'), 'reanalyze': ('admin', 'analyst')}
 
     def normalize_kind(self, kind):
         return self.ALIASES.get(kind, kind)

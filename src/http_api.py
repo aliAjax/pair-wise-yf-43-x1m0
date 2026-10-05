@@ -118,6 +118,12 @@ def create_handler(service, rules, static_dir):
                         200,
                         service.transition(actor, parts[2], action, data, expected),
                     )
+                if len(parts) == 3 and parts[:2] == ["api", "results"] and parts[2] in ("backfill", "recalculate"):
+                    if parts[2] == "backfill":
+                        result = service.backfill(actor)
+                    else:
+                        result = service.recalculate(actor)
+                    return self._send(200, result)
                 if len(parts) == 4 and parts[0] == "api" and parts[3] == "actions":
                     body = self._body()
                     action = body.pop("action", None)
